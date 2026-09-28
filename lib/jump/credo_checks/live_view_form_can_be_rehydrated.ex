@@ -8,12 +8,18 @@ defmodule Jump.CredoChecks.LiveViewFormCanBeRehydrated do
 
   Forms that opt out of recovery via `phx-auto-recover="ignore"` are not required to have
   `phx-change`, since they have explicitly disabled the rehydration behavior.
+
+  The check recognizes `<form>`, `<.form>`, `<Form.form>` and `<PetalComponents.Form.form>`. If your
+  project renders forms through its own wrapper component (for instance, the `<.simple_form>` that
+  older Phoenix generators produced), list it in the `extra_form_components` param so those forms
+  are checked too.
   """
   use Credo.Check,
     base_priority: :high,
     category: :warning,
     param_defaults: [
-      excluded: []
+      excluded: [],
+      extra_form_components: []
     ],
     explanations: [
       check: """
@@ -30,7 +36,14 @@ defmodule Jump.CredoChecks.LiveViewFormCanBeRehydrated do
       ❌ Bad (missing ID and phx-change):
 
           <.form phx-submit="save">
-      """
+      """,
+      params: [
+        excluded: "A list of path substrings. Files whose path contains any of them are not checked.",
+        extra_form_components: """
+        A list of additional form components to check, each written as the tag appears after the `<`
+        (for instance, `".simple_form"` or `"MyAppWeb.Components.form"`).
+        """
+      ]
     ]
 
   alias Credo.Check.Params
@@ -55,9 +68,10 @@ defmodule Jump.CredoChecks.LiveViewFormCanBeRehydrated do
     source_file = Credo.IssueMeta.source_file(parent_issue_meta)
     line = meta[:line]
     issue_meta = Credo.IssueMeta.for(source_file, line: line)
+    form_patterns = form_patterns(IssueMeta.params(parent_issue_meta), "is missing 'id' attribute.")
 
     # Check the raw HEEX string for forms without IDs
-    new_issues = check_heex_string_for_forms(heex, issue_meta, meta[:indentation], line)
+    new_issues = check_heex_string_for_forms(heex, form_patterns, issue_meta, meta[:indentation], line)
     {node, issues ++ new_issues}
   end
 
@@ -86,30 +100,49 @@ defmodule Jump.CredoChecks.LiveViewFormCanBeRehydrated do
 
   defp traverse(node, issues, _issue_meta), do: {node, issues}
 
+  # The form spellings to check, in order of specificity, as `{trigger, pattern, message}`.
+  # Project-specific components come first, since they are the most specific of all.
+  defp form_patterns(params, message_suffix) do
+    extra_components =
+      params
+      |> Params.get(:extra_form_components, __MODULE__)
+      |> List.wrap()
+      |> Enum.map(&{&1, "Form component <#{&1}> #{message_suffix}"})
+
+    builtin_components = [
+      {"PetalComponents.Form.form", "Form component <PetalComponents.Form.form> #{message_suffix}"},
+      {"Form.form", "Form component <Form.form> #{message_suffix}"},
+      {".form", "Form component <.form> #{message_suffix}"},
+      {"form", "Raw HTML <form> tag #{message_suffix}"}
+    ]
+
+    Enum.map(extra_components ++ builtin_components, fn {component, message} ->
+      trigger = "<" <> component
+      {trigger, Regex.compile!(Regex.escape(trigger) <> "\\b", "i"), message}
+    end)
+  end
+
   # Check a HEEX string for forms without IDs
-  defp check_heex_string_for_forms(heex_string, issue_meta, indentation, base_line) do
+  defp check_heex_string_for_forms(heex_string, form_patterns, issue_meta, indentation, base_line) do
     # First, find all form tags and check if they have IDs (handling multiline tags)
-    find_forms_without_ids(heex_string, base_line + 1, indentation, issue_meta)
+    find_forms_without_ids(heex_string, form_patterns, base_line + 1, indentation, issue_meta)
   end
 
   # Find form tags and check if they have IDs, handling multiline tags
-  defp find_forms_without_ids(heex_string, base_line, indentation, issue_meta) do
-    # Define form patterns to check (in order of specificity)
-    form_patterns = [
-      {"<PetalComponents.Form.form", ~r/<PetalComponents\.Form\.form\b/i,
-       "Form component <PetalComponents.Form.form> is missing 'id' attribute."},
-      {"<Form.form", ~r/<Form\.form\b/i, "Form component <Form.form> is missing 'id' attribute."},
-      {"<.form", ~r/<\.form\b/i, "Form component <.form> is missing 'id' attribute."},
-      {"<form", ~r/<form\b/i, "Raw HTML <form> tag is missing 'id' attribute."}
-    ]
-
+  defp find_forms_without_ids(heex_string, form_patterns, base_line, indentation, issue_meta) do
     lines = heex_string |> String.split("\n") |> Enum.with_index(base_line)
 
     # Find all issues across all patterns, then deduplicate by line number
     # (keeping only the most specific pattern per line)
     form_patterns
     |> Enum.flat_map(fn {trigger, pattern, message} ->
-      find_pattern_matches(lines, pattern, trigger, message, indentation, issue_meta)
+      lines
+      |> find_complete_tags(pattern, trigger, message)
+      |> Enum.flat_map(fn tag ->
+        tag
+        |> Map.merge(%{indentation: indentation, issue_meta: issue_meta})
+        |> form_complete_issues()
+      end)
     end)
     |> deduplicate_issues_by_line()
   end
@@ -123,61 +156,89 @@ defmodule Jump.CredoChecks.LiveViewFormCanBeRehydrated do
     |> Enum.sort_by(fn issue -> issue.line_no end)
   end
 
-  # Find all matches of a pattern and check if the tag has required attributes
-  defp find_pattern_matches(lines, pattern, trigger, message, indentation, issue_meta) do
+  # Find every opening tag matching `pattern`, with the attributes written between the tag name
+  # and the tag's own closing `>`, which may sit several lines later. A tag that never closes is
+  # dropped.
+  defp find_complete_tags(lines, pattern, trigger, message) do
     lines
-    |> Enum.reduce({[], nil}, fn {line, line_no}, {issues, current_tag} ->
-      cond do
-        # If we're tracking a tag, check if this line closes it or has required attributes
-        is_map(current_tag) ->
-          current_tag = %{
-            current_tag
-            | has_phx_submit?: current_tag.has_phx_submit? or Regex.match?(~r/\bphx-submit\s*=/i, line),
-              has_id?: current_tag.has_id? or Regex.match?(~r/\bid\s*=/i, line),
-              has_phx_validate?: current_tag.has_phx_validate? or Regex.match?(~r/\bphx-change\s*=/i, line),
-              has_auto_recover_ignore?:
-                current_tag.has_auto_recover_ignore? or
-                  Regex.match?(~r/\bphx-auto-recover\s*=\s*["']ignore["']/i, line)
-          }
+    |> Enum.reduce({[], nil}, fn
+      # If we're tracking a tag, read this line's attributes up to the tag's closing `>`
+      {line, _line_no}, {tags, %{} = open_tag} ->
+        open_tag
+        |> read_attributes(line)
+        |> close_or_track(tags)
 
-          if String.contains?(line, ">") do
-            {form_complete_issues(current_tag) ++ issues, nil}
-          else
-            # Tag continues on next line, update tracking
-            {issues, current_tag}
-          end
+      # Otherwise, check if this line starts a new tag
+      {line, line_no}, {tags, nil} ->
+        case Regex.run(pattern, line, return: :index) do
+          [{start, length} | _] ->
+            # Only the text after the tag name belongs to this tag
+            rest = binary_part(line, start + length, byte_size(line) - start - length)
 
-        # Check if this line starts a new tag
-        Regex.match?(pattern, line) ->
-          # Check if the tag has required attributes on the same line
-          current_tag = %{
-            has_phx_submit?: Regex.match?(~r/\bphx-submit\s*=/i, line),
-            has_id?: Regex.match?(~r/\bid\s*=/i, line),
-            has_phx_validate?: Regex.match?(~r/\bphx-change\s*=/i, line),
-            has_auto_recover_ignore?: Regex.match?(~r/\bphx-auto-recover\s*=\s*["']ignore["']/i, line),
-            tag_message: message,
-            tag_line: line,
-            indentation: indentation,
-            tag_line_no: line_no,
-            issue_meta: issue_meta,
-            tag_trigger: trigger
-          }
+            %{
+              has_phx_submit?: false,
+              has_id?: false,
+              has_phx_validate?: false,
+              has_auto_recover_ignore?: false,
+              scan_state: {0, nil},
+              tag_message: message,
+              tag_line: line,
+              tag_line_no: line_no,
+              tag_trigger: trigger
+            }
+            |> read_attributes(rest)
+            |> close_or_track(tags)
 
-          if String.contains?(line, ">") do
-            {form_complete_issues(current_tag) ++ issues, nil}
-          else
-            # Tag continues on next line, track it
-            {issues, current_tag}
-          end
-
-        # No match on this line
-        true ->
-          {issues, current_tag}
-      end
+          nil ->
+            {tags, nil}
+        end
     end)
     |> elem(0)
     |> Enum.reverse()
   end
+
+  defp read_attributes(tag, text) do
+    {tag_text, scan_state} = tag_text(text, tag.scan_state)
+
+    %{
+      tag
+      | has_phx_submit?: tag.has_phx_submit? or phx_submit?(tag_text),
+        has_id?: tag.has_id? or id?(tag_text),
+        has_phx_validate?: tag.has_phx_validate? or phx_change?(tag_text),
+        has_auto_recover_ignore?: tag.has_auto_recover_ignore? or auto_recover_ignore?(tag_text),
+        scan_state: scan_state
+    }
+  end
+
+  defp close_or_track(%{scan_state: :closed} = tag, tags), do: {[tag | tags], nil}
+  defp close_or_track(tag, tags), do: {tags, tag}
+
+  # Returns the part of `text` that belongs to the tag, and either `:closed` when the tag's own
+  # closing `>` is in `text`, or the state to carry onto the next line. A `>` inside a `{...}`
+  # interpolation or a quoted attribute value does not close the tag, so `:if={@count > 0}` is
+  # read as one attribute. A quote counts only outside interpolations, where it delimits a value.
+  defp tag_text(text, state), do: tag_text(text, state, 0)
+
+  defp tag_text(text, state, offset) when offset >= byte_size(text), do: {text, state}
+
+  defp tag_text(text, {depth, quote_char} = state, offset) do
+    case {:binary.at(text, offset), depth, quote_char} do
+      {?>, 0, nil} -> {binary_part(text, 0, offset), :closed}
+      {char, 0, nil} when char in [?", ?'] -> tag_text(text, {0, char}, offset + 1)
+      {char, 0, char} -> tag_text(text, {0, nil}, offset + 1)
+      {?{, depth, nil} -> tag_text(text, {depth + 1, nil}, offset + 1)
+      {?}, depth, nil} when depth > 0 -> tag_text(text, {depth - 1, nil}, offset + 1)
+      _other -> tag_text(text, state, offset + 1)
+    end
+  end
+
+  # An attribute name must not be the tail of a longer name, so `phx-value-user-id=` is not an
+  # `id` and `data-phx-change=` is not a `phx-change`.
+  defp phx_submit?(text), do: Regex.match?(~r/(?<![\w-])phx-submit\s*=/i, text)
+  defp id?(text), do: Regex.match?(~r/(?<![\w-])id\s*=/i, text)
+  defp phx_change?(text), do: Regex.match?(~r/(?<![\w-])phx-change\s*=/i, text)
+
+  defp auto_recover_ignore?(text), do: Regex.match?(~r/(?<![\w-])phx-auto-recover\s*=\s*["']ignore["']/i, text)
 
   defp form_complete_issues(%{has_phx_submit?: false}), do: []
 
@@ -241,184 +302,58 @@ defmodule Jump.CredoChecks.LiveViewFormCanBeRehydrated do
 
   # Find form tags in .heex files and check if they have IDs
   defp find_forms_without_ids_in_heex_file(content, heex_file, params, issue_category, exit_status_or_category) do
-    # Define form patterns to check (in order of specificity)
-    form_patterns = [
-      {"<PetalComponents.Form.form", ~r/<PetalComponents\.Form\.form\b/i,
-       "Form component <PetalComponents.Form.form> found without an 'id' attribute."},
-      {"<Form.form", ~r/<Form\.form\b/i, "Form component <Form.form> found without an 'id' attribute."},
-      {"<.form", ~r/<\.form\b/i, "Form component <.form> found without an 'id' attribute."},
-      {"<form", ~r/<form\b/i, "Raw HTML <form> tag found without an 'id' attribute."}
-    ]
-
+    form_patterns = form_patterns(params, "found without an 'id' attribute.")
     lines = content |> String.split("\n") |> Enum.with_index(1)
 
     # Find all issues across all patterns, then deduplicate by line number
     # (keeping only the most specific pattern per line)
     form_patterns
     |> Enum.flat_map(fn {trigger, pattern, message} ->
-      find_pattern_matches_in_heex_file(
-        lines,
-        pattern,
-        trigger,
-        message,
-        heex_file,
-        params,
-        issue_category,
-        exit_status_or_category
-      )
+      lines
+      |> find_complete_tags(pattern, trigger, message)
+      |> Enum.flat_map(&heex_file_issues(&1, heex_file, params, issue_category, exit_status_or_category))
     end)
     |> deduplicate_issues_by_line()
   end
 
-  # Find all matches of a pattern in .heex files and check if the tag has required attributes
-  defp find_pattern_matches_in_heex_file(
-         lines,
-         pattern,
-         trigger,
-         message,
-         heex_file,
-         params,
-         issue_category,
-         exit_status_or_category
-       ) do
-    lines
-    |> Enum.reduce({[], nil}, fn {line, line_no}, {issues, current_tag} ->
-      cond do
-        # If we're tracking a tag, check if this line closes it or has required attributes
-        current_tag != nil ->
-          {tag_line, tag_line_no, tag_trigger, tag_message, has_phx_submit, has_id, has_phx_validate,
-           has_auto_recover_ignore} = current_tag
+  # Only report if tag has phx-submit but missing id or phx-change
+  defp heex_file_issues(%{has_phx_submit?: false}, _heex_file, _params, _issue_category, _exit_status_or_category),
+    do: []
 
-          # Check for required attributes on this line
-          has_phx_submit = has_phx_submit or Regex.match?(~r/\bphx-submit\s*=/i, line)
-          has_id_on_line = has_id or Regex.match?(~r/\bid\s*=/i, line)
-          has_phx_validate_on_line = has_phx_validate or Regex.match?(~r/\bphx-change\s*=/i, line)
+  defp heex_file_issues(tag, heex_file, params, issue_category, exit_status_or_category) do
+    missing_attrs = []
+    missing_attrs = if tag.has_id?, do: missing_attrs, else: ["id" | missing_attrs]
 
-          has_auto_recover_ignore_on_line =
-            has_auto_recover_ignore or Regex.match?(~r/\bphx-auto-recover\s*=\s*["']ignore["']/i, line)
+    missing_attrs =
+      if tag.has_phx_validate? or tag.has_auto_recover_ignore?,
+        do: missing_attrs,
+        else: ["phx-change" | missing_attrs]
 
-          # Tag closes on this line
-          if String.contains?(line, ">") do
-            # Only report if tag has phx-submit but missing id or phx-change
-            new_issues =
-              if has_phx_submit do
-                missing_attrs = []
-                missing_attrs = if has_id_on_line, do: missing_attrs, else: ["id" | missing_attrs]
+    if Enum.empty?(missing_attrs) do
+      []
+    else
+      attr_list = Enum.join(Enum.reverse(missing_attrs), " and ")
 
-                missing_attrs =
-                  if has_phx_validate_on_line or has_auto_recover_ignore_on_line,
-                    do: missing_attrs,
-                    else: ["phx-change" | missing_attrs]
+      custom_message =
+        String.replace(
+          tag.tag_message,
+          "'id' attribute",
+          "'#{attr_list}' #{if length(missing_attrs) == 1, do: "attribute", else: "attributes"}"
+        )
 
-                if Enum.empty?(missing_attrs) do
-                  []
-                else
-                  attr_list = Enum.join(Enum.reverse(missing_attrs), " and ")
-
-                  custom_message =
-                    String.replace(
-                      tag_message,
-                      "'id' attribute",
-                      "'#{attr_list}' #{if length(missing_attrs) == 1, do: "attribute", else: "attributes"}"
-                    )
-
-                  issue =
-                    create_heex_file_issue(
-                      tag_line,
-                      tag_line_no,
-                      heex_file,
-                      tag_trigger,
-                      custom_message,
-                      params,
-                      issue_category,
-                      exit_status_or_category
-                    )
-
-                  [issue]
-                end
-              else
-                []
-              end
-
-            {new_issues ++ issues, nil}
-          else
-            # Tag continues on next line, update tracking
-            {issues,
-             {tag_line, tag_line_no, tag_trigger, tag_message, has_phx_submit, has_id_on_line, has_phx_validate_on_line,
-              has_auto_recover_ignore_on_line}}
-          end
-
-        # Check if this line starts a new tag
-        Regex.match?(pattern, line) ->
-          # Check if the tag has required attributes on the same line
-          has_phx_submit = Regex.match?(~r/\bphx-submit\s*=/i, line)
-          has_id_on_line = Regex.match?(~r/\bid\s*=/i, line)
-          has_phx_validate_on_line = Regex.match?(~r/\bphx-change\s*=/i, line)
-
-          has_auto_recover_ignore_on_line =
-            Regex.match?(~r/\bphx-auto-recover\s*=\s*["']ignore["']/i, line)
-
-          # Check if the tag closes on the same line
-          closes_on_line = String.contains?(line, ">")
-
-          # Tag closes on same line
-          if closes_on_line do
-            # Only create issue if has phx-submit but missing id or phx-change
-            new_issues =
-              if has_phx_submit do
-                missing_attrs = []
-                missing_attrs = if has_id_on_line, do: missing_attrs, else: ["id" | missing_attrs]
-
-                missing_attrs =
-                  if has_phx_validate_on_line or has_auto_recover_ignore_on_line,
-                    do: missing_attrs,
-                    else: ["phx-change" | missing_attrs]
-
-                if Enum.empty?(missing_attrs) do
-                  []
-                else
-                  attr_list = Enum.join(Enum.reverse(missing_attrs), " and ")
-
-                  custom_message =
-                    String.replace(
-                      message,
-                      "'id' attribute",
-                      "'#{attr_list}' #{if length(missing_attrs) == 1, do: "attribute", else: "attributes"}"
-                    )
-
-                  issue =
-                    create_heex_file_issue(
-                      line,
-                      line_no,
-                      heex_file,
-                      trigger,
-                      custom_message,
-                      params,
-                      issue_category,
-                      exit_status_or_category
-                    )
-
-                  [issue]
-                end
-              else
-                []
-              end
-
-            {new_issues ++ issues, nil}
-          else
-            # Tag continues on next line, track it
-            {issues,
-             {line, line_no, trigger, message, has_phx_submit, has_id_on_line, has_phx_validate_on_line,
-              has_auto_recover_ignore_on_line}}
-          end
-
-        # No match on this line
-        true ->
-          {issues, current_tag}
-      end
-    end)
-    |> elem(0)
-    |> Enum.reverse()
+      [
+        create_heex_file_issue(
+          tag.tag_line,
+          tag.tag_line_no,
+          heex_file,
+          tag.tag_trigger,
+          custom_message,
+          params,
+          issue_category,
+          exit_status_or_category
+        )
+      ]
+    end
   end
 
   defp create_heex_file_issue(

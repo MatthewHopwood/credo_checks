@@ -382,4 +382,241 @@ defmodule Jump.CredoChecks.LiveViewFormCanBeRehydratedTest do
     |> run_check(LiveViewFormCanBeRehydrated)
     |> assert_issue()
   end
+
+  describe "extra_form_components" do
+    test "does not check a wrapper component unless it is listed" do
+      """
+      defmodule TestLive do
+        use Phoenix.Component
+
+        def render(assigns) do
+          ~H\"\"\"
+          <.simple_form for={@form} phx-submit="save">
+            <input type="text" name="name" />
+          </.simple_form>
+          \"\"\"
+        end
+      end
+      """
+      |> to_source_file()
+      |> run_check(LiveViewFormCanBeRehydrated)
+      |> refute_issues()
+    end
+
+    test "reports a listed wrapper component without id and phx-change" do
+      """
+      defmodule TestLive do
+        use Phoenix.Component
+
+        def render(assigns) do
+          ~H\"\"\"
+          <.simple_form for={@form} phx-submit="save">
+            <input type="text" name="name" />
+          </.simple_form>
+          \"\"\"
+        end
+      end
+      """
+      |> to_source_file()
+      |> run_check(LiveViewFormCanBeRehydrated, extra_form_components: [".simple_form"])
+      |> assert_issue(fn issue ->
+        assert issue.trigger == "<.simple_form"
+        assert issue.message =~ "<.simple_form>"
+      end)
+    end
+
+    test "does not report a listed wrapper component with id and phx-change" do
+      """
+      defmodule TestLive do
+        use Phoenix.Component
+
+        def render(assigns) do
+          ~H\"\"\"
+          <.simple_form
+              for={@form}
+              id="user-form"
+              phx-submit="save"
+              phx-change="validate"
+          >
+            <input type="text" name="name" />
+          </.simple_form>
+          \"\"\"
+        end
+      end
+      """
+      |> to_source_file()
+      |> run_check(LiveViewFormCanBeRehydrated, extra_form_components: [".simple_form"])
+      |> refute_issues()
+    end
+
+    test "reports a listed remote wrapper component" do
+      """
+      defmodule TestLive do
+        use Phoenix.Component
+
+        def render(assigns) do
+          ~H\"\"\"
+          <MyAppWeb.Forms.form for={@form} id="user-form" phx-submit="save">
+            <input type="text" name="name" />
+          </MyAppWeb.Forms.form>
+          \"\"\"
+        end
+      end
+      """
+      |> to_source_file()
+      |> run_check(LiveViewFormCanBeRehydrated, extra_form_components: ["MyAppWeb.Forms.form"])
+      |> assert_issue(fn issue -> assert issue.trigger == "<MyAppWeb.Forms.form" end)
+    end
+  end
+
+  describe "attribute names" do
+    test "does not read the tail of a longer attribute name as an id" do
+      """
+      defmodule TestLive do
+        use Phoenix.Component
+
+        def render(assigns) do
+          ~H\"\"\"
+          <.form for={@form} phx-submit="save" phx-change="validate" phx-value-user-id={@user.id}>
+            <input type="text" name="name" />
+          </.form>
+          \"\"\"
+        end
+      end
+      """
+      |> to_source_file()
+      |> run_check(LiveViewFormCanBeRehydrated)
+      |> assert_issue()
+    end
+
+    test "does not read data-phx-change as phx-change" do
+      """
+      defmodule TestLive do
+        use Phoenix.Component
+
+        def render(assigns) do
+          ~H\"\"\"
+          <.form id="user-form" for={@form} phx-submit="save" data-phx-change="validate">
+            <input type="text" name="name" />
+          </.form>
+          \"\"\"
+        end
+      end
+      """
+      |> to_source_file()
+      |> run_check(LiveViewFormCanBeRehydrated)
+      |> assert_issue()
+    end
+
+    test "does not credit the form with attributes of an element before it on the same line" do
+      """
+      defmodule TestLive do
+        use Phoenix.Component
+
+        def render(assigns) do
+          ~H\"\"\"
+          <div id="wrapper" phx-change="noop"><.form for={@form} phx-submit="save">
+            <input type="text" name="name" />
+          </.form></div>
+          \"\"\"
+        end
+      end
+      """
+      |> to_source_file()
+      |> run_check(LiveViewFormCanBeRehydrated)
+      |> assert_issue()
+    end
+  end
+
+  describe "where a multi-line tag ends" do
+    test "a > inside an interpolated attribute does not end the tag" do
+      """
+      defmodule TestLive do
+        use Phoenix.Component
+
+        def render(assigns) do
+          ~H\"\"\"
+          <.form
+              :if={@count > 0}
+              for={@form}
+              phx-submit="save"
+          >
+            <input type="text" name="name" />
+          </.form>
+          \"\"\"
+        end
+      end
+      """
+      |> to_source_file()
+      |> run_check(LiveViewFormCanBeRehydrated)
+      |> assert_issue()
+    end
+
+    test "a > inside a quoted attribute value does not end the tag" do
+      """
+      defmodule TestLive do
+        use Phoenix.Component
+
+        def render(assigns) do
+          ~H\"\"\"
+          <.form
+              data-confirm="Continue -> save?"
+              for={@form}
+              phx-submit="save"
+          >
+            <input type="text" name="name" />
+          </.form>
+          \"\"\"
+        end
+      end
+      """
+      |> to_source_file()
+      |> run_check(LiveViewFormCanBeRehydrated)
+      |> assert_issue()
+    end
+
+    test "attributes after an interpolated > still count" do
+      """
+      defmodule TestLive do
+        use Phoenix.Component
+
+        def render(assigns) do
+          ~H\"\"\"
+          <.form
+              :if={@count > 0}
+              id="user-form"
+              for={@form}
+              phx-submit="save"
+              phx-change="validate"
+          >
+            <input type="text" name="name" />
+          </.form>
+          \"\"\"
+        end
+      end
+      """
+      |> to_source_file()
+      |> run_check(LiveViewFormCanBeRehydrated)
+      |> refute_issues()
+    end
+
+    test "attributes of a child element do not count" do
+      """
+      defmodule TestLive do
+        use Phoenix.Component
+
+        def render(assigns) do
+          ~H\"\"\"
+          <.form for={@form} phx-submit="save">
+            <input type="text" name="name" id="name" phx-change="validate" />
+          </.form>
+          \"\"\"
+        end
+      end
+      """
+      |> to_source_file()
+      |> run_check(LiveViewFormCanBeRehydrated)
+      |> assert_issue()
+    end
+  end
 end

@@ -171,7 +171,8 @@ The following instructions assume you already have Credo configured and working 
                functions: [
                  {:erlang, :binary_to_term, "Use Plug.Crypto.non_executable_binary_to_term/2 instead."},
                ]},
-              {Jump.CredoChecks.LiveViewFormCanBeRehydrated, excluded: ["lib/my_app/"]},
+              {Jump.CredoChecks.LiveViewFormCanBeRehydrated,
+               excluded: ["lib/my_app/"], extra_form_components: [".simple_form"]},
               {Jump.CredoChecks.LiveViewPubSubRequiresConnected,
                custom_pubsub_functions: [{MyAppWeb.PubSub, :subscribe}, {:my_imported_subscribe, 1}]},
               {Jump.CredoChecks.NoManualContentDisposition, []},
